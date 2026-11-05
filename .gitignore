@@ -1,0 +1,14 @@
+# Market data (hundreds of MB; rebuild with fetch-data.ps1 / convert-history.py)
+data/
+
+# TI-84 build output (bin/GRAYRPLY.8xp is kept)
+ti84/obj/
+ti84/bin/*
+!ti84/bin/GRAYRPLY.8xp
+
+# Packs other than the sample week
+ti84/packs/*
+!ti84/packs/W1012/
+
+__pycache__/
+.claude/

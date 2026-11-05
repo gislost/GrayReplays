@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GrayReplays</title>
+<style>
+  :root {
+    --bg: #131722; --panel: #1e222d; --line: #2a2e39; --text: #d1d4dc; --muted: #787b86;
+    --accent: #2962ff; --up: #089981; --down: #f23645;
+    --accent-ink: #fff; --up-ink: #fff; --down-ink: #fff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  button, select, input { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; }
+  button { padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  button.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button:disabled { opacity: .4; cursor: default; }
+  input, select { padding: 3px 6px; }
+  input[type=number] { width: 64px; }
+  input[type=checkbox] { accent-color: var(--accent); }
+  label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .group { display: flex; align-items: center; gap: 4px; }
+  .tf { padding: 4px 8px; }
+  #clock { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+  #clock .live { color: var(--muted); font-weight: 400; }
+
+  #charts { flex: 1; display: flex; min-height: 0; }
+  .pane { flex: 1; position: relative; min-width: 0; border: 2px solid transparent; }
+  .pane + .pane { border-left: 1px solid var(--line); }
+  .pane.active { border-color: var(--accent); }
+  .pane .chart { position: absolute; inset: 0; }
+  .tag { position: absolute; top: 6px; left: 10px; z-index: 3; font-weight: 700; font-size: 15px; pointer-events: none; }
+  .tag small { font-weight: 400; color: var(--muted); }
+
+  footer { display: grid; grid-template-columns: minmax(300px, 1.1fr) minmax(220px, .8fr) minmax(320px, 1.6fr); border-top: 1px solid var(--line); background: var(--panel); height: 210px; }
+  footer > div { padding: 10px 12px; min-width: 0; overflow: auto; }
+  footer > div + div { border-left: 1px solid var(--line); }
+  h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  h3 .spacer { flex: 1; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 8px; }
+  #buy { background: var(--up); border-color: var(--up); color: var(--up-ink); font-weight: 600; }
+  #sell { background: var(--down); border-color: var(--down); color: var(--down-ink); font-weight: 600; }
+  input:disabled { opacity: .45; }
+  #sizeInfo { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #sizeInfo.neg { color: var(--down); }
+  .brand { font-weight: 800; letter-spacing: .02em; font-size: 15px; }
+  .brand span { color: var(--accent); }
+  #loading { color: var(--accent); font-weight: 600; }
+  #tfCustom { cursor: default; padding: 4px 8px; }
+  body.tool-armed .chart, body.tool-armed .chart * { cursor: crosshair !important; }
+  #tfOverlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; z-index: 20; pointer-events: none; }
+  #tfOverlay > div { background: var(--panel); border: 1px solid var(--accent); border-radius: 8px; padding: 14px 26px; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,.4); }
+  #tfoText { font-size: 30px; font-weight: 700; min-width: 80px; font-variant-numeric: tabular-nums; }
+  #tfoHint { color: var(--muted); font-size: 12px; }
+  #positions div { margin: 2px 0; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--up); } .neg { color: var(--down); }
+  #msg { color: #f7a600; min-height: 18px; }
+
+  .stats { display: grid; grid-template-columns: auto auto; gap: 3px 14px; font-variant-numeric: tabular-nums; }
+  .stats span:nth-child(odd) { color: var(--muted); }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12px; }
+  th, td { text-align: right; padding: 3px 6px; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+
+  #nodata { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: var(--bg); z-index: 10; text-align: center; padding: 16px; }
+  code { background: var(--panel); padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">Gray<span>Replays</span></div>
+  <div class="group" id="tfs"><button class="on" id="tfCustom" style="display:none" title="Custom timeframe (type digits, e.g. 2h)"></button></div>
+  <div class="group">
+    <label for="start">Replay from (NY)</label>
+    <input type="datetime-local" id="start">
+    <button id="go">Start replay</button>
+    <button id="exit" title="Leave replay and show all data">Show all</button>
+  </div>
+  <div class="group">
+    <button id="back" title="Back one candle (Left arrow)">&#9664; Back</button>
+    <button id="play" title="Play / pause (Space)">&#9654; Play</button>
+    <button id="step" title="Forward one candle (Right arrow). Shift+Right steps 1 minute">Step &#9654;</button>
+    <select id="speed" title="Play speed">
+      <option value="1000">1 min / sec</option>
+      <option value="400">2.5 min / sec</option>
+      <option value="200" selected>5 min / sec</option>
+      <option value="100">10 min / sec</option>
+      <option value="33">30 min / sec</option>
+      <option value="16">1 hr / sec</option>
+    </select>
+  </div>
+  <div class="group">
+    <label for="jump">Jump to</label>
+    <select id="jump" title="Session open to jump to"></select>
+    <button id="jumpPrev" title="Previous session open (Shift+J)">&#9664;</button>
+    <button id="jumpNext" title="Next session open (J)">&#9654;</button>
+  </div>
+  <div class="group">
+    <label><input type="checkbox" id="kz" checked> Killzones</label>
+    <label><input type="checkbox" id="lv" checked> Levels</label>
+    <select id="theme" title="Chart theme"></select>
+  </div>
+  <span id="loading" style="display:none">Loading…</span>
+  <div id="clock"></div>
+</header>
+
+<main id="charts">
+  <section class="pane" data-sym="NQ"><div class="tag">NQ <small>E-mini Nasdaq</small></div><div class="chart"></div></section>
+  <section class="pane" data-sym="ES"><div class="tag">ES <small>E-mini S&amp;P</small></div><div class="chart"></div></section>
+</main>
+
+<footer>
+  <div>
+    <h3>Trade <span id="activeName"></span></h3>
+    <div class="row">
+      <label title="When Risk $ is set, contracts are sized from it">Risk $ <input type="number" id="risk" min="0" step="50" placeholder="off"></label>
+      <label>Contracts <input type="number" id="qty" min="1" step="1" value="1"></label>
+      <label><input type="checkbox" id="micro"> Micro</label>
+    </div>
+    <div class="row">
+      <label>Stop pts <input type="number" id="slpts" min="0" step="0.25"></label>
+      <label>Target pts <input type="number" id="tppts" min="0" step="0.25" title="Empty = stop x R:R"></label>
+      <label>R:R <input type="number" id="rr" min="0" step="0.5" value="2" style="width:52px"></label>
+    </div>
+    <div class="row"><span id="sizeInfo"></span></div>
+    <div class="row">
+      <button id="buy" title="Market buy (B)">Buy</button>
+      <button id="sell" title="Market sell (S)">Sell</button>
+      <button id="close" title="X">Close</button>
+      <button id="toolLong" title="Long position tool: click the chart at your stop (L)">Long tool</button>
+      <button id="toolShort" title="Short position tool: click the chart at your stop (Shift+L)">Short tool</button>
+    </div>
+    <div id="positions"></div>
+    <div id="msg"></div>
+  </div>
+  <div>
+    <h3>Stats</h3>
+    <div class="stats" id="stats"></div>
+  </div>
+  <div>
+    <h3>Trades <span class="spacer"></span><button id="export">Export CSV</button><button id="clear">Clear</button></h3>
+    <table>
+      <thead><tr><th>Sym</th><th>Side</th><th>Entry (NY)</th><th>Entry</th><th>Exit</th><th>Exit by</th><th>Pts</th><th>R</th><th>$</th></tr></thead>
+      <tbody id="log"></tbody>
+    </table>
+  </div>
+</footer>
+
+<div id="nodata"><div>
+  <h2>No market data found</h2>
+  <p>Run <code>powershell -ExecutionPolicy Bypass -File .\fetch-data.ps1</code> in this folder, then reload this page.</p>
+</div></div>
+
+<div id="tfOverlay"><div><div id="tfoText"></div><div id="tfoHint"></div></div></div>
+
+<script src="lib/lightweight-charts.js"></script>
+<script src="data/data.js"></script>
+<!-- Optional long history; missing until the history converter has finished -->
+<script src="data/hist/manifest.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
