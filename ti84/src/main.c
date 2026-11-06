@@ -11,9 +11,10 @@
 #include <graphx.h>
 #include <fileioc.h>
 #include <ti/getcsc.h>
+#include <keypadc.h>
 
 /* ------------------------------------------------------------------ colors */
-enum { C_BG = 0, C_GRID, C_TEXT, C_UP, C_DN, C_DIM, C_BLUE, C_YEL, C_WHITE, C_BAR, C_ORG, C_DAY, C_SEL, C_BLACK };
+enum { C_BG = 0, C_GRID, C_TEXT, C_UP, C_DN, C_DIM, C_BLUE, C_YEL, C_WHITE, C_BAR, C_ORG, C_DAY, C_SEL, C_BLACK, C_BOXF, C_OTEF, C_FVGU, C_FVGD };
 
 static void set_palette(void)
 {
@@ -31,6 +32,10 @@ static void set_palette(void)
     gfx_palette[C_DAY]   = gfx_RGBTo1555(70, 74, 92);
     gfx_palette[C_SEL]   = gfx_RGBTo1555(50, 70, 120);
     gfx_palette[C_BLACK] = gfx_RGBTo1555(0, 0, 0);
+    gfx_palette[C_BOXF]  = gfx_RGBTo1555(30, 44, 78);
+    gfx_palette[C_OTEF]  = gfx_RGBTo1555(66, 56, 22);
+    gfx_palette[C_FVGU]  = gfx_RGBTo1555(22, 62, 60);
+    gfx_palette[C_FVGD]  = gfx_RGBTo1555(74, 32, 36);
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -141,6 +146,26 @@ static const uint8_t *open_ptr(const char *name)
     return p;
 }
 
+/* ------------------------------------------------------------------ red-folder news (optional GW<tag>) */
+static const uint8_t *nw;
+static uint16_t nnw;
+#define NW_REC 24
+#define NW_MIN(k) rd32(nw + 7 + (uint24_t)(k) * NW_REC)
+#define NW_LAB(k) ((const char *)nw + 7 + (uint24_t)(k) * NW_REC + 4)
+
+/* first news event at/after unix minute m (nnw if none) */
+static uint16_t nw_at(uint32_t m)
+{
+    uint16_t lo = 0, hi = nnw;
+    while (lo < hi) {
+        uint16_t mid = (uint16_t)((lo + hi) / 2);
+        if (NW_MIN(mid) < m) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+static uint16_t newshit; /* 1 + index of the news event the last step landed on */
+
 static char errmsg[40];
 
 static bool load_pack(const char *hname)
@@ -169,6 +194,9 @@ static bool load_pack(const char *hname)
                 return false;
             }
         }
+    sprintf(nm, "GW%s", tag);
+    nw = open_ptr(nm);
+    nnw = (nw && !memcmp(nw, "GRNW", 4)) ? rd16(nw + 5) : 0;
     return true;
 }
 
@@ -351,8 +379,15 @@ static void open_pos(int8_t side)
 /* ------------------------------------------------------------------ stepping */
 static bool step1(void)
 {
+    uint32_t a;
+    uint16_t k;
     if (st.cur + 1 >= N) { playing = false; say("End of data pack"); return false; }
+    a = umin(st.cur);
     st.cur++;
+    if (nnw) {
+        k = nw_at(a + 1);
+        if (k < nnw && NW_MIN(k) <= umin(st.cur)) newshit = k + 1;
+    }
     check_exit();
     return true;
 }
@@ -476,6 +511,124 @@ static void axis_tag(int p, int y, uint8_t bg, uint8_t fg)
     text(b, AXX + 1, y - 3, fg);
 }
 
+
+/* ------------------------------------------------------------------ drawings (ICT tools) */
+enum { D_BOX = 1, D_OTE, D_LVL, D_TREND };
+typedef struct { uint8_t type, sym; uint24_t i1, i2; int p1, p2; } draw_t;
+#define MAXDR 32
+static draw_t dr[MAXDR + 1];   /* last slot = live preview while placing */
+static uint8_t ndr, nprev;
+static bool fvg_on;
+static bool curs_on;
+static uint8_t curs_s;
+static uint24_t curs_i;
+static int curs_p;
+static char hint[44];
+static int sch[2], schi[2], sclo[2];
+
+static const int16_t FIBR[10] = { 1000, 790, 705, 620, 500, 0, -270, -620, -1000, -2000 };
+static const char *FIBL[10] = { "1", ".79", ".705", ".62", ".5", "0", "-.27", "-.62", "-1", "-2" };
+static int fibp(const draw_t *d, int16_t r) { return d->p2 + (int)((int32_t)(d->p1 - d->p2) * r / 1000); }
+
+/* bar slot holding candle i: -1 left of view, nb right of view */
+static int jof(uint24_t i)
+{
+    uint8_t j;
+    if (!nb || i < sp[0].i0) return -1;
+    for (j = 0; j < nb; j++) if (i <= sp[j].i1) return j;
+    return nb;
+}
+
+static int xof(uint24_t i, uint8_t cell)
+{
+    int j = jof(i);
+    if (j < 0) return -4;
+    if (j >= nb) j = nb - 1;
+    return j * cell + 1 + (cell - 2) / 2;
+}
+
+static void hdash(int x0, int y, uint8_t step)
+{
+    int x;
+    for (x = x0; x < CHW; x += step) gfx_HorizLine(x, y, step / 2);
+}
+
+/* phase 0 = fills under the candles, 1 = lines/labels/cursor over them */
+static void draw_marks(uint8_t s, uint8_t phase, uint8_t cell)
+{
+    uint8_t n, j;
+    gfx_SetClipRegion(0, py0 + 1, CHW, py0 + ph);
+    if (phase == 0 && fvg_on) {
+        for (j = 2; j < nb; j++) {
+            int top, bot, x0 = (j - 1) * cell + 1, x1 = CHW;
+            uint8_t k;
+            bool bull;
+            if (bar[j].l > bar[j - 2].h) { bull = true; bot = bar[j - 2].h; top = bar[j].l; }
+            else if (bar[j].h < bar[j - 2].l) { bull = false; top = bar[j - 2].l; bot = bar[j].h; }
+            else continue;
+            for (k = j + 1; k < nb; k++)
+                if (bull ? bar[k].l <= bot : bar[k].h >= top) { x1 = k * cell + 1 + cell / 2; break; }
+            gfx_SetColor(bull ? C_FVGU : C_FVGD);
+            gfx_FillRectangle(x0, Y(top), x1 - x0, Y(bot) - Y(top) + 1);
+        }
+    }
+    if (phase == 1) gfx_SetTextConfig(gfx_text_clip);
+    for (n = 0; n < ndr + nprev; n++) {
+        const draw_t *d = &dr[n];
+        int xa, xb, ya, yb, t;
+        if (d->sym != s) continue;
+        xa = xof(d->i1, cell); xb = xof(d->i2, cell);
+        ya = Y(d->p1); yb = Y(d->p2);
+        if (d->type == D_TREND) {
+            if (phase) { gfx_SetColor(C_WHITE); gfx_Line(xa, ya, xb, yb); }
+            continue;
+        }
+        if (xb < xa) xa = xb;
+        if (yb < ya) { t = ya; ya = yb; yb = t; }
+        if (d->type == D_BOX) {
+            gfx_SetColor(phase ? C_BLUE : C_BOXF);
+            if (phase) gfx_Rectangle(xa, ya, CHW - xa + 2, yb - ya + 1);
+            else gfx_FillRectangle(xa, ya, CHW - xa, yb - ya + 1);
+        } else if (d->type == D_LVL) {
+            if (phase) { gfx_SetColor(C_ORG); gfx_HorizLine(xa, ya, CHW - xa); }
+        } else if (d->type == D_OTE) {
+            if (!phase) {
+                int y1 = Y(fibp(d, 620)), y2 = Y(fibp(d, 790));
+                if (y2 < y1) { t = y1; y1 = y2; y2 = t; }
+                gfx_SetColor(C_OTEF);
+                gfx_FillRectangle(xa, y1, CHW - xa, y2 - y1 + 1);
+            } else {
+                int lasty = -100;
+                uint8_t r;
+                for (r = 0; r < 10; r++) {
+                    int y = Y(fibp(d, FIBR[r]));
+                    uint8_t col = FIBR[r] == 1000 || FIBR[r] == 0 ? C_DIM : FIBR[r] == 500 ? C_TEXT : FIBR[r] > 0 ? C_YEL : C_ORG;
+                    gfx_SetColor(col);
+                    if (FIBR[r] == 705 || FIBR[r] == 0 || FIBR[r] == 1000) gfx_HorizLine(xa, y, CHW - xa);
+                    else hdash(xa, y, 4);
+                    if (y - lasty >= 9 || lasty - y >= 9) {
+                        int w = (int)gfx_GetStringWidth(FIBL[r]);
+                        gfx_SetColor(C_BG);
+                        gfx_FillRectangle(CHW - w - 3, y - 4, w + 2, 9);
+                        text(FIBL[r], CHW - w - 2, y - 3, col);
+                        lasty = y;
+                    }
+                }
+            }
+        }
+    }
+    if (phase == 1 && curs_on && curs_s == s) {
+        int x = xof(curs_i, cell), y = Y(curs_p), t;
+        gfx_SetColor(C_WHITE);
+        for (t = py0 + 1; t < py0 + ph; t += 3) gfx_VertLine(x, t, 1);
+        for (t = 0; t < CHW; t += 3) gfx_HorizLine(t, y, 1);
+        gfx_Rectangle(x - 2, y - 2, 5, 5);
+    }
+    gfx_SetClipRegion(0, 0, 320, 240);
+    gfx_SetTextConfig(gfx_text_noclip);
+    if (phase == 1 && curs_on && curs_s == s) axis_tag(curs_p, Y(curs_p), C_WHITE, C_BLACK);
+}
+
 static const int NICE[] = { 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000 };
 
 static void draw_pane(uint8_t s, int y0, int h, bool mark)
@@ -495,9 +648,14 @@ static void draw_pane(uint8_t s, int y0, int h, bool mark)
         if (z > hi) hi = z;
         if (a < lo) lo = a;
     }
+    if (curs_on && curs_s == s) {
+        if (curs_p > hi) hi = curs_p;
+        if (curs_p < lo) lo = curs_p;
+    }
     pad = (hi - lo) / 16 + 2;
     hi += pad; lo -= pad;
     py0 = y0; ph = h; phi = hi; plo = lo;
+    sch[s] = h; schi[s] = hi; sclo[s] = lo;
 
     /* grid: nice step in points, at most ~5 lines */
     for (j = 0; j < sizeof NICE / sizeof NICE[0] - 1; j++)
@@ -513,6 +671,8 @@ static void draw_pane(uint8_t s, int y0, int h, bool mark)
         }
     }
 
+    draw_marks(s, 0, cell);
+
     /* day separators (18:00 NY session start) and bars */
     for (j = 0; j < nb; j++) {
         candle_t *k = &bar[j];
@@ -523,12 +683,26 @@ static void draw_pane(uint8_t s, int y0, int h, bool mark)
             gfx_SetColor(C_DAY);
             for (y = y0; y < y0 + h; y += 4) gfx_VertLine_NoClip(x0 - 1, y, 2);
         }
+        if (nnw) {
+            /* red-folder news released inside this bar: red dotted line + flag on top */
+            uint32_t m0 = umin(sp[j].i0);
+            uint32_t m1 = j + 1 < nb ? umin(sp[j + 1].i0) : umin(sp[j].i1) + 1;
+            uint16_t q = nw_at(m0);
+            if (q < nnw && NW_MIN(q) < m1) {
+                int y, xc = x0 + bw / 2;
+                gfx_SetColor(C_DN);
+                for (y = y0 + 12; y < y0 + h; y += 3) gfx_SetPixel(xc, y);
+                gfx_FillRectangle_NoClip(xc - 2, y0 + 11, 5, 4);
+            }
+        }
         gfx_SetColor(col);
         gfx_VertLine_NoClip(x0 + bw / 2, Y(k->h), Y(k->l) - Y(k->h) + 1);
         top = Y(k->c > k->o ? k->c : k->o);
         bot = Y(k->c > k->o ? k->o : k->c);
         gfx_FillRectangle_NoClip(x0, top, bw, bot - top + 1);
     }
+
+    draw_marks(s, 1, cell);
 
     if (lines) {
         dashed(Y(pos.entry), C_BLUE);
@@ -545,6 +719,29 @@ static void draw_pane(uint8_t s, int y0, int h, bool mark)
     gfx_FillRectangle_NoClip(1, y0 + 1, 26, 9);
     text(SYM[s], 3, y0 + 2, mark ? C_YEL : C_TEXT);
     if (mark) text("*", 20, y0 + 2, C_YEL);
+
+    /* next red-folder event within 24h (top pane only) */
+    if (nnw && y0 == 22) {
+        uint32_t now = umin(st.cur);
+        uint16_t q = nw_at(now + 1);
+        if (q < nnw && NW_MIN(q) - now <= 1440) {
+            uint32_t lm = (uint32_t)((int32_t)NW_MIN(q) + SEG_OFF(seg_of(st.cur)));
+            uint32_t left = NW_MIN(q) - now;
+            int mins = (int)(lm % 1440), w;
+            char nb_[48];
+            if (left < 60) sprintf(nb_, "NEWS %02d:%02d %s in %lum", mins / 60, mins % 60, NW_LAB(q), (unsigned long)left);
+            else sprintf(nb_, "NEWS %s %02d:%02d %s", WDAY[(lm / 1440 + 4) % 7], mins / 60, mins % 60, NW_LAB(q));
+            w = (int)gfx_GetStringWidth(nb_);
+            if (w > CHW - 32) w = CHW - 32;
+            gfx_SetColor(C_DN);
+            gfx_FillRectangle_NoClip(29, y0 + 1, w + 4, 9);
+            gfx_SetTextConfig(gfx_text_clip);
+            gfx_SetClipRegion(29, y0, 29 + w + 3, y0 + 10);
+            text(nb_, 31, y0 + 2, C_WHITE);
+            gfx_SetClipRegion(0, 0, 320, 240);
+            gfx_SetTextConfig(gfx_text_noclip);
+        }
+    }
 }
 
 static void draw_status(void)
@@ -575,7 +772,11 @@ static void draw_status(void)
         fmt_price(b, x->h); fmt_price(c, x->l); fmt_price(d, x->c);
         sprintf(a, "H %s L %s C %s", b, c, d);
     }
-    text(a, 2, 12, C_TEXT);
+    if (curs_on && hint[0]) {
+        gfx_SetColor(C_BAR);
+        gfx_FillRectangle_NoClip(0, 11, 320, 10);
+        text(hint, 2, 12, C_YEL);
+    } else text(a, 2, 12, C_TEXT);
 
     /* bottom line 1: message / position / flat summary */
     if (msg[0] && (int32_t)(msg_until - clock()) > 0) {
@@ -662,13 +863,14 @@ static void jump_menu(void)
     uint8_t i, k;
     render(); /* fresh frame in front buffer */
     gfx_SetDrawScreen();
-    panel(60, 50, 200, 112, "Jump to next session open");
+    panel(60, 50, 200, 126, "Jump to next session open");
     for (i = 0; i < 6; i++) {
         sprintf(b, "%u  %s", i + 1, L[i]);
         text(b, 70, 66 + i * 12, C_TEXT);
     }
     text("0  Start of pack", 70, 66 + 6 * 12, C_TEXT);
-    text("clear  cancel", 70, 66 + 7 * 12 + 4, C_DIM);
+    text(nnw ? "7  Next red-folder news" : "7  (no news for this pack)", 70, 66 + 7 * 12, nnw ? C_DN : C_DIM);
+    text("clear  cancel", 70, 66 + 8 * 12 + 4, C_DIM);
     gfx_SetDrawBuffer();
     k = wait_key();
     switch (k) {
@@ -682,6 +884,26 @@ static void jump_menu(void)
             if (pos.on) say("Close the trade first");
             else st.cur = 0;
             return;
+        case sk_7: {
+            /* stop on the last candle before the next red-folder release */
+            uint16_t q = nnw ? nw_at(umin(st.cur) + 1) : 0;
+            uint32_t M;
+            if (!nnw || q >= nnw) { say("No later red-folder news"); return; }
+            M = NW_MIN(q);
+            if (st.cur + 1 < N && umin(st.cur + 1) >= M) q = nw_at(M + 1); /* already right before it: go to the one after */
+            if (q >= nnw) { say("No later red-folder news"); return; }
+            M = NW_MIN(q);
+            playing = false;
+            exited = false;
+            while (st.cur + 1 < N && umin(st.cur + 1) < M) {
+                step1();
+                if (exited) return;
+            }
+            newshit = 0;
+            sprintf(b, "Next: %s", NW_LAB(q));
+            say(b);
+            return;
+        }
         default: return;
     }
     playing = false;
@@ -850,7 +1072,8 @@ static void help_screen(void)
         "zoom RISK     stop, target, $ risk",
         "trace LOG     trades and stats",
         "clear         save and exit",
-        "",
+        "window 7      next red-folder news",
+        "x (times)     DRAW box OTE level FVG",
         "Stop is checked before target on",
         "every 1m candle. Fill = bar close.",
     };
@@ -878,6 +1101,10 @@ static void save_session(void)
     memcpy(st.magic, "GRSV", 4);
     ti_Write(&st, sizeof st, 1, h);
     if (st.ntr) ti_Write(tr, sizeof(trade_t), st.ntr, h);
+    ti_Write("GRDR", 4, 1, h);
+    ti_Write(&fvg_on, 1, 1, h);
+    ti_Write(&ndr, 1, 1, h);
+    if (ndr) ti_Write(dr, sizeof(draw_t), ndr, h);
     ti_Close(h);
 }
 
@@ -894,6 +1121,14 @@ static bool load_session(void)
         st = t;
         ok = ti_Read(tr, sizeof(trade_t), st.ntr, h) == st.ntr;
         if (!ok) st.ntr = 0;
+        else {
+            char m[4];
+            uint8_t f, n;
+            if (ti_Read(m, 4, 1, h) == 1 && !memcmp(m, "GRDR", 4) && ti_Read(&f, 1, 1, h) == 1 &&
+                ti_Read(&n, 1, 1, h) == 1 && n <= MAXDR && (!n || ti_Read(dr, sizeof(draw_t), n, h) == n)) {
+                fvg_on = f; ndr = n;
+            }
+        }
         ok = true;
     }
     ti_Close(h);
@@ -913,12 +1148,124 @@ static void defaults(void)
 {
     uint24_t i;
     memset(&st, 0, sizeof st);
+    ndr = 0; fvg_on = false;
     st.tf = 0; st.view = 0; st.tsym = 0; st.zoom = 1; st.speed = 1; st.micro = 0;
     st.stopT[0] = 20 * 4; st.tgtT[0] = 40 * 4;
     st.stopT[1] = 5 * 4;  st.tgtT[1] = 10 * 4;
     st.risk = 500;
     i = find_time(0, 570);
     st.cur = i ? i - 1 : (N > 120 ? 120 : N - 1);
+}
+
+static void news_say(void)
+{
+    char m[44];
+    sprintf(m, "RED NEWS: %s", NW_LAB(newshit - 1));
+    say(m);
+    newshit = 0;
+}
+
+
+/* ------------------------------------------------------------------ draw mode */
+static const char *TOOLN[5] = { "", "Box", "OTE", "Level", "Trend" };
+
+/* move a cursor over the bars and drop 1 or 2 points; true if a drawing was added */
+static bool place(uint8_t tool, uint8_t s)
+{
+    uint8_t pts = tool == D_LVL ? 1 : 2, got = 0, held = 0, k;
+    clock_t t0 = 0;
+    draw_t *d = &dr[ndr];
+    candle_t c;
+    bool ok = false;
+    rd_candle(s, st.cur, &c);
+    curs_on = true; curs_s = s; curs_i = st.cur; curs_p = c.c;
+    d->type = tool; d->sym = s;
+    for (;;) {
+        uint8_t ar;
+        int j;
+        if (got) { d->i2 = curs_i; d->p2 = curs_p; nprev = 1; }
+        sprintf(hint, "%s pt%u: arrows 2nd=hi alpha=lo enter", TOOLN[tool], got + 1);
+        render();
+        /* wait for a key; arrows auto-repeat while held */
+        for (;;) {
+            kb_Scan();
+            ar = kb_Data[7] & (kb_Up | kb_Down | kb_Left | kb_Right);
+            k = os_GetCSC();
+            if (k == sk_Up || k == sk_Down || k == sk_Left || k == sk_Right) k = 0;
+            if (ar) {
+                if (ar != held) { held = ar; t0 = clock(); break; }
+                if ((clock_t)(clock() - t0) > CLOCKS_PER_SEC * 3 / 10) break;
+            } else held = 0;
+            if (k) { ar = 0; break; }
+        }
+        j = jof(curs_i);
+        if (j >= nb) j = nb - 1;
+        if (ar & (kb_Up | kb_Down)) {
+            int stp = (schi[s] - sclo[s]) * 2 / (sch[s] ? sch[s] : 1);
+            if (stp < 1) stp = 1;
+            curs_p += (ar & kb_Up) ? stp : -stp;
+        }
+        if ((ar & kb_Left) && j > 0) curs_i = sp[j - 1].i0;
+        if ((ar & kb_Right) && j + 1 < nb) curs_i = sp[j + 1].i0;
+        if (ar) continue;
+        switch (k) {
+            case sk_2nd: case sk_Alpha:
+                if (j >= 0) { agg(s); curs_p = k == sk_2nd ? bar[j].h : bar[j].l; }
+                break;
+            case sk_Add: if (st.zoom < 4) st.zoom++; break;
+            case sk_Sub: if (st.zoom > 0) st.zoom--; break;
+            case sk_1: st.tf = 0; break;
+            case sk_2: st.tf = 1; break;
+            case sk_3: st.tf = 2; break;
+            case sk_4: st.tf = 3; break;
+            case sk_Enter:
+                if (!got) {
+                    d->i1 = curs_i; d->p1 = curs_p; got = 1;
+                    if (pts == 1) { d->i2 = curs_i; d->p2 = curs_p; ok = true; }
+                } else ok = true;
+                break;
+            case sk_Clear: case sk_Mul: goto out;
+            default: break;
+        }
+        if (ok) { ndr++; break; }
+    }
+out:
+    curs_on = false; nprev = 0; hint[0] = 0;
+    return ok;
+}
+
+static void draw_mode(void)
+{
+    char b[40];
+    uint8_t k, tool, s = st.view == 2 ? st.tsym : st.view;
+    playing = false;
+    render();
+    gfx_SetDrawScreen();
+    panel(20, 40, 280, 150, "Draw - ICT tools");
+    text("1  Box / zone (OB, FVG, range)", 28, 56, C_TEXT);
+    text("2  OTE fib: swing start, then end", 28, 68, C_YEL);
+    text("3  Level line  (PDH, PDL, EQ)", 28, 80, C_ORG);
+    text("4  Trend line", 28, 92, C_TEXT);
+    text(fvg_on ? "5  Auto FVGs: ON" : "5  Auto FVGs: OFF", 28, 104, fvg_on ? C_UP : C_TEXT);
+    text("6  Undo last drawing", 28, 116, C_TEXT);
+    text("7  Delete all drawings", 28, 128, C_TEXT);
+    sprintf(b, "%u/%u drawings   clear: back", ndr, MAXDR);
+    text(b, 28, 176, C_DIM);
+    text("OTE zone .62-.79  tgts -.27/-1", 28, 152, C_DIM);
+    gfx_SetDrawBuffer();
+    k = wait_key();
+    switch (k) {
+        case sk_1: tool = D_BOX; break;
+        case sk_2: tool = D_OTE; break;
+        case sk_3: tool = D_LVL; break;
+        case sk_4: tool = D_TREND; break;
+        case sk_5: fvg_on = !fvg_on; say(fvg_on ? "Auto FVGs on" : "Auto FVGs off"); return;
+        case sk_6: if (ndr) { ndr--; say("Removed last drawing"); } return;
+        case sk_7: ndr = 0; say("All drawings deleted"); return;
+        default: return;
+    }
+    if (ndr >= MAXDR) { say("32 drawings max - undo some"); return; }
+    if (place(tool, s)) { sprintf(b, "%s added (x then 6 = undo)", TOOLN[tool]); say(b); }
 }
 
 /* ------------------------------------------------------------------ replay loop */
@@ -937,10 +1284,13 @@ static void replay(void)
                 uint8_t n;
                 last = clock();
                 exited = false;
+                newshit = 0;
                 for (n = 0; n < SPDN[st.speed] && playing; n++) {
                     if (!step1()) break;
                     if (exited) { playing = false; break; }
+                    if (newshit) { playing = false; break; }
                 }
+                if (newshit && !exited) news_say();
                 dirty = true;
             } else if (msg[0] && (int32_t)(msg_until - clock()) <= 0) {
                 msg[0] = 0;
@@ -950,9 +1300,9 @@ static void replay(void)
         }
         dirty = true;
         switch (k) {
-            case sk_Right: playing = false; step_bar(); break;
+            case sk_Right: playing = false; newshit = 0; exited = false; step_bar(); if (newshit && !exited) news_say(); break;
             case sk_Left: playing = false; step_back(); break;
-            case sk_DecPnt: playing = false; step1(); break;
+            case sk_DecPnt: playing = false; newshit = 0; exited = false; step1(); if (newshit && !exited) news_say(); break;
             case sk_Enter: playing = !playing; last = clock(); break;
             case sk_Up: if (st.speed < 4) st.speed++; break;
             case sk_Down: if (st.speed > 0) st.speed--; break;
@@ -975,6 +1325,7 @@ static void replay(void)
                 if (st.view < 2) st.tsym = st.view;
                 break;
             case sk_Window: jump_menu(); break;
+            case sk_Mul: draw_mode(); break;
             case sk_Zoom: playing = false; risk_menu(); break;
             case sk_Trace: playing = false; log_screen(); break;
             case sk_Graph: playing = false; help_screen(); break;
@@ -1080,7 +1431,7 @@ int main(void)
                     panel(50, 90, 220, 50, "Saved session found");
                     text("enter: resume   del: start new", 58, 112, C_TEXT);
                     k = wait_key();
-                    if (k == sk_Del) { st = keep; }
+                    if (k == sk_Del) { st = keep; ndr = 0; fvg_on = false; }
                     else if (k != sk_Enter) continue;
                 }
             }

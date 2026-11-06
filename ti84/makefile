@@ -4,7 +4,7 @@
 
 NAME = GRAYRPLY
 DESCRIPTION = "GrayReplays NQ/ES bar replay"
-COMPRESSED = NO
+COMPRESSED = YES
 
 CFLAGS = -Wall -Wextra -Oz
 CXXFLAGS = -Wall -Wextra -Oz

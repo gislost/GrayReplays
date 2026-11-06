@@ -12,3 +12,6 @@ ti84/packs/*
 
 __pycache__/
 .claude/
+
+# Red-folder news data scraped from ForexFactory (rebuild locally; not redistributed)
+news/
